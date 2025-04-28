@@ -80,7 +80,7 @@ sequenceDiagram
 [x] 2.  **Install Dependencies:**
     *   `npm install hono ai-to-openai-hono @ai-sdk/google zod`
 
-[x] 3.  **Configure `wrangler.toml`:**
+[x] 3.  **Configure `wrangler.jsonc`:**
     *   Set `name`, `main = "src/index.ts"`, `compatibility_date`.
 
 4.  **Set Up Secrets & Local Vars:**
@@ -95,82 +95,70 @@ sequenceDiagram
 
 5.  **Initial Worker Code (`src/index.ts`):**
     ```typescript
-    import { Hono } from 'hono';
-    import { createOpenAIHono } from 'ai-to-openai-hono';
-    import { createGoogleGenerativeAI } from '@ai-sdk/google';
-    import { LanguageModel } from '@ai-sdk/provider';
+    import { createGoogleGenerativeAI } from "@ai-sdk/google";
+    import type { LanguageModelV1 } from "@ai-sdk/provider";
+    import { createOpenAICompat } from "@ns/ai-to-openai-hono";
+    import { Hono } from "hono";
 
-    type Bindings = {
-      GOOGLE_API_KEY: string;
-      CLOUDFLARE_ACCOUNT_ID: string;
-      CLOUDFLARE_AI_GATEWAY: string;
-      // Add KV binding later: MODEL_CONFIG: KVNamespace;
-    };
-
-    const app = new Hono<{ Bindings: Bindings }>();
+    // Module-scoped map to store initialized models
+    let modelsMap: Record<string, LanguageModelV1> = {};
 
     // Helper to initialize models - will be expanded in Phase 2
-    function initializeLanguageModels(env: Bindings): Record<string, LanguageModel> {
-        const models: Record<string, LanguageModel> = {};
-
-        // Configure Google Gemini (Hardcoded for Phase 1)
-        if (env.GOOGLE_API_KEY && env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_AI_GATEWAY) {
-            const google = createGoogleGenerativeAI({
-                baseURL: `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${env.CLOUDFLARE_AI_GATEWAY}/google-ai-studio/v1beta`,
-                apiKey: env.GOOGLE_API_KEY,
-            });
-            // Map user-facing name "gemini-pro" to the actual Google model instance
-            models['gemini-pro'] = google('gemini-1.5-pro-latest'); // Use the actual model name
+    async function initializeLanguageModels(env: CloudflareBindings): Promise<Record<string, LanguageModelV1>> {
+        const models: Record<string, LanguageModelV1> = {};
+        // Configure Google Gemini using AI Gateway
+        if (env.AI && env.AI_GATEWAY_NAME && env.GOOGLE_API_KEY) {
+            try {
+                const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
+                const googleURL = await gateway.getUrl("google-ai-studio");
+                if (!googleURL) {
+                    throw new Error("Failed to get Google AI Studio URL from AI Gateway.");
+                }
+                const token = env.AI_GATEWAY_TOKEN;
+                const google = createGoogleGenerativeAI({
+                    baseURL: `${googleURL}/v1beta`,
+                    apiKey: env.GOOGLE_API_KEY,
+                    headers: { "cf-aig-authorization": `Bearer ${token}` },
+                });
+                models["gemini-flash"] = google("gemini-2.0-flash");
+            } catch (error) {
+                console.error("Error initializing Google Gemini via AI Gateway:", error);
+            }
         } else {
-            console.warn("Google Gemini provider not configured due to missing environment variables/secrets.");
+            console.warn(
+                "Google Gemini provider not configured via AI Gateway due to missing bindings or environment variables/secrets (AI, AI_GATEWAY_NAME, GOOGLE_API_KEY).",
+            );
         }
-        // Add more providers here in later phases
         return models;
     }
 
-    // Middleware to initialize models and store them in context
-    // This ensures 'env' is available during initialization
-    app.use('*', async (c, next) => {
-        if (!c.get('languageModels')) {
-             // In a real app, consider caching this initialization result
-             const models = initializeLanguageModels(c.env);
-             c.set('languageModels', models);
+    const app = new Hono<{ Bindings: CloudflareBindings; Variables: { languageModels: Record<string, LanguageModelV1> } }>();
+
+    app.use("*", async (c, next) => {
+        if (Object.keys(modelsMap).length === 0) {
+            modelsMap = await initializeLanguageModels(c.env);
         }
         await next();
     });
 
-    // Create the OpenAI-compatible router
-    const aiRouter = createOpenAIHono({
-        // Retrieve the initialized models map from context for each request
-        getLanguageModels: (c) => {
-            const models = c.get('languageModels');
-            if (!models) {
-                console.error("Language models not initialized in context!");
-                return {}; // Return empty or throw error
-            }
-            return models;
-        },
-        // Optional: Add API key verification later
-        // verifyAPIKey(key, c) { ... }
+    const aiRouter = createOpenAICompat({
+        languageModels: (modelId: string) => modelsMap[modelId] ?? null,
     });
 
-    // Mount the AI router at the /v1 path
-    app.route('/v1', aiRouter);
-
-    // Basic health check endpoint
-    app.get('/', (c) => c.text('OpenAI Compatible Gateway Running'));
+    // Mount the AI router at the root path
+    app.route("/", aiRouter);
 
     export default app;
     ```
 
 6.  **Local Development & Testing:**
     *   Run `npx wrangler dev`.
-    *   Send a `curl` request to `http://localhost:8787/v1/chat/completions` with `model: "gemini-pro"`.
+    *   Send a `curl` request to `http://localhost:8787/v1/chat/completions` with `model: "gemini-flash"`.
         ```bash
         curl http://localhost:8787/v1/chat/completions \
           -H "Content-Type: application/json" \
           -d '{
-            "model": "gemini-pro",
+            "model": "gemini-flash",
             "messages": [{"role": "user", "content": "Explain Cloudflare AI Gateway briefly."}],
             "max_tokens": 60
           }'
@@ -183,37 +171,115 @@ sequenceDiagram
 
 **Phase 2: Dynamic Configuration with KV**
 
-1.  **Create KV Namespace:**
-    *   `npx wrangler kv namespace create MODEL_CONFIG`
-    *   Add the binding (including `preview_id`) to `wrangler.toml`.
-
-2.  **Populate KV:**
-    *   Define `model_configs.json` mapping user-facing names to provider details:
-        ```json
-        [
-          {
-            "key": "gemini-pro",
-            "value": "{\"provider\":\"google\",\"model\":\"gemini-1.5-pro-latest\",\"apiKeySecretName\":\"GOOGLE_API_KEY\",\"gatewayProviderPath\":\"google-ai-studio/v1beta\"}"
-          }
-          // Add more model configs here
-        ]
+1.  **Bindings Update:**
+    *   Add in `wrangler.jsonc`:
+        ```jsonc
+        {
+          "kv_namespaces": [
+            {
+              "binding": "MODEL_CONFIG",
+              "preview_id": "..."
+            }
+          ]
+        }
         ```
-    *   Upload: `npx wrangler kv bulk put --binding=MODEL_CONFIG model_configs.json`
+    *   Extend the `Bindings` type:
+        ```typescript
+        type Bindings = {
+          AI: AiGatewayBindings;
+          AI_GATEWAY_NAME: string;
+          MODEL_CONFIG: KVNamespace;
+          // existing env vars
+        };
+        ```
 
-3.  **Update Worker Code (`src/index.ts`):**
-    *   Add `MODEL_CONFIG: KVNamespace;` to the `Bindings` type.
-    *   Create/Modify a function `initializeModelsFromKV(env)`:
-        *   This function will list keys from `env.MODEL_CONFIG`.
-        *   For each key, get the config string, parse the JSON (`ModelConfig` type).
-        *   Retrieve the API key: `const apiKey = env[config.apiKeySecretName];`.
-        *   Construct the AI Gateway `baseURL`.
-        *   Use a `switch(config.provider)` to instantiate the correct Vercel AI SDK client (`createGoogleGenerativeAI`, etc.).
-        *   Add the configured provider instance to the `models` map: `models[keyName] = providerInstance(config.model);`.
-        *   Return the `models` map.
-    *   Update the middleware (`app.use`) to call `initializeModelsFromKV` instead of the hardcoded version.
-    *   Implement caching for the KV results within the Worker instance if desired (e.g., using a global variable with a simple TTL check) to reduce KV reads.
+2.  **Define Configuration Schema:**
+    ```ts
+    interface ModelConfig {
+      provider: string;
+      model: string;
+      apiKeySecretName: string;
+      gatewayProviderPath: string;
+    }
+    ```
 
-4.  **Test & Deploy:** Test locally (`wrangler dev --remote` recommended for KV access) and deploy. Verify `gemini-pro` still works and that the configuration is read from KV.
+3.  **Async Initialization Function:**
+    ```typescript
+    // Module-level cache
+    let modelsMap: Record<string, LanguageModelV1> = {};
+    let modelsInitializedAt = 0;
+    const CACHE_TTL_MS = Number(env.MODEL_CACHE_TTL_MS) || 300_000;
+
+    async function initializeLanguageModels(env: CloudflareBindings): Promise<Record<string, LanguageModelV1>> {
+      const models: Record<string, LanguageModelV1> = {};
+      try {
+        const list = await env.MODEL_CONFIG.list();
+        for (const { name } of list.keys) {
+          const raw = await env.MODEL_CONFIG.get(name);
+          if (!raw) continue;
+          let cfg: ModelConfig;
+          try { cfg = JSON.parse(raw); }
+          catch (e) {
+            console.error(`Invalid JSON in MODEL_CONFIG for '${name}':`, e);
+            continue;
+          }
+          const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
+          const url = await gateway.getUrl(cfg.gatewayProviderPath);
+          if (!url) {
+            console.error(`Failed to resolve gateway URL for '${cfg.gatewayProviderPath}'`);
+            continue;
+          }
+          const headers = { 'cf-aig-authorization': `Bearer ${env.AI_GATEWAY_TOKEN}` };
+          let clientFactory;
+          switch (cfg.provider) {
+            case 'google':
+              clientFactory = createGoogleGenerativeAI({ baseURL: `${url}/v1beta`, apiKey: env[cfg.apiKeySecretName], headers });
+              break;
+            // Add more providers in later phases
+            default:
+              console.warn(`Unsupported provider '${cfg.provider}'`);
+              continue;
+          }
+          models[name] = clientFactory(cfg.model);
+        }
+        modelsInitializedAt = Date.now();
+        modelsMap = models;
+      } catch (e) {
+        console.error('Error initializing models from KV:', e);
+      }
+      return modelsMap;
+    }
+
+4.  **Middleware with TTL Caching:**
+    ```typescript
+    app.use('*', async (c, next) => {
+      const now = Date.now();
+      if (!modelsMap || now - modelsInitializedAt > CACHE_TTL_MS) {
+        await initializeLanguageModels(c.env);
+      }
+      await next();
+    });
+    ```
+
+5.  **Create Router:**
+    ```typescript
+    const aiRouter = createOpenAICompat({
+      languageModels: (id) => modelsMap[id] ?? null,
+    });
+    app.route('/', aiRouter);
+    ```
+
+6.  **Testing & Error Scenarios:**
+    *   Run `direnv exec . npx wrangler dev --remote`.
+    *   Insert/update KV entries, e.g. `wrangler kv:key put --binding=MODEL_CONFIG gemini-flash '{...}'`.
+    *   Send test prompts to each model via `curl http://localhost:8787/v1/chat/completions -d '{"model":"<key>","messages":[...]}'.`
+    *   Verify valid responses and check logs for errors.
+    *   Test invalid JSON in KV and ensure errors are logged without crashing.
+
+7.  **Security Considerations:**
+    *   Do not log secret values or tokens.
+    *   Ensure `AI_GATEWAY_TOKEN` and API key secrets remain in environment and not in KV.
+    *   Limit KV permissions appropriately and rotate tokens regularly.
 
 **Phase 3: Add Anthropic Provider**
 
@@ -223,22 +289,22 @@ sequenceDiagram
 4.  **Update Worker Code (`src/index.ts`):**
     *   Add `import { createAnthropic } from '@ai-sdk/anthropic';`.
     *   Add `ANTHROPIC_API_KEY: string;` to `Bindings`.
-    *   Add a `case 'anthropic':` to the `switch` statement within `initializeModelsFromKV` to handle Anthropic client instantiation.
+    *   Add a `case 'anthropic':` to the `switch` statement within `initializeLanguageModels` to handle Anthropic client instantiation.
 5.  **Test & Deploy:** Test with `model: "claude-3-haiku"` (or your configured name). Verify requests route correctly via AI Gateway to Anthropic.
 
 **Phase 4: Implement Client API Key Verification**
 
 1.  **Storage:**
     *   Create KV namespace: `npx wrangler kv namespace create CLIENT_KEYS`
-    *   Add binding to `wrangler.toml`.
+    *   Add binding to `wrangler.jsonc`.
     *   Populate `CLIENT_KEYS` with valid client API keys (e.g., `wrangler kv key put --binding=CLIENT_KEYS <client_api_key> "true"`).
 
 2.  **Update Worker Code (`src/index.ts`):**
     *   Add `CLIENT_KEYS: KVNamespace;` to the `Bindings` type.
-    *   Implement the `verifyAPIKey` function within the `createOpenAIHono` options:
+    *   Implement the `verifyAPIKey` function within the `createOpenAICompat` options:
         ```typescript
-        const aiRouter = createOpenAIHono({
-            getLanguageModels: (c) => c.get('languageModels'),
+        const aiRouter = createOpenAICompat({
+            languageModels: (modelId: string) => modelsMap[modelId] ?? null,
             async verifyAPIKey(key, c) { // Hono context 'c' is passed
                 if (!c) return false;
                 const env = c.env as Bindings; // Access env via context
