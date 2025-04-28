@@ -42,7 +42,14 @@
 	 */
 	"vars": {
 		"AI_GATEWAY_NAME": "openai-gateway"
-	}
+	},
+	"kv_namespaces": [
+		{
+			"binding": "PROVIDER_CONFIG",
+			"preview_id": "provider_config_preview",
+			"id": "provider_config_id"
+		}
+	]
 
 	/**
 	 * Static Assets

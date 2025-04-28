@@ -246,11 +246,9 @@ Once verified, replace the body of `initializeProviders` to read from KV as desc
 ### High-Level Steps
 
 1. Store provider configs in KV: key=`<provider>`, value=`{ provider, apiKeySecretName, gatewayProviderPath }`.
-2. Rename `ModelConfig` to `ProviderConfig` and remove the `model` field.
 3. In KV initialization, load provider configs into a `providersMap: Record<string, (model: string) => LanguageModelV1>`.
 4. Update the `languageModels` function to parse `<provider>/<modelName>` and call the matching factory.
 5. Update caching/TTL logic to reload `providersMap` when expired.
-6. Remove per-model KV entries and migrate them to provider-level entries.
 
 ## 2. Implementation Plan
 
@@ -267,15 +265,6 @@ Once verified, replace the body of `initializeProviders` to read from KV as desc
             }
           ]
         }
-        ```
-    *   Extend the `Bindings` type:
-        ```typescript
-        type Bindings = {
-          AI: AiGatewayBindings;
-          AI_GATEWAY_NAME: string;
-          PROVIDER_CONFIG: KVNamespace;
-          // existing env vars
-        };
         ```
 
 2.  **Define Configuration Schema:**
