@@ -24,11 +24,12 @@ function hasSecret<K extends string>(
 	return typeof (env as any)[key] === "string";
 }
 
-// Helper to initialize providers from KV
+// initialize providers from KV
 async function initializeProviders(
 	env: CloudflareBindings,
 ): Promise<typeof providersMap> {
 	const providers: Record<string, (model: string) => LanguageModelV1> = {};
+	const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
 	try {
 		const list = await env.PROVIDER_CONFIG.list();
 		for (const { name: provider } of list.keys) {
@@ -41,7 +42,7 @@ async function initializeProviders(
 				console.error(`Invalid JSON in PROVIDER_CONFIG for '${provider}':`, e);
 				continue;
 			}
-			const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
+
 			const url = await gateway.getUrl(cfg.gatewayProviderPath);
 			// explicit runtime check for missing secret
 			if (!hasSecret(env, cfg.apiKeySecretName)) {
@@ -49,7 +50,6 @@ async function initializeProviders(
 					`Missing secret '${cfg.apiKeySecretName}' in environment for provider '${provider}'`,
 				);
 			}
-			// now TS knows env[cfg.apiKeySecretName] is string
 			const apiKey = env[cfg.apiKeySecretName];
 			let clientFactory: (model: string) => LanguageModelV1;
 			switch (cfg.provider) {
