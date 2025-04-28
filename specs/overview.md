@@ -262,7 +262,7 @@ Once verified, replace the body of `initializeProviders` to read from KV as desc
         {
           "kv_namespaces": [
             {
-              "binding": "MODEL_CONFIG",
+              "binding": "PROVIDER_CONFIG",
               "preview_id": "..."
             }
           ]
@@ -273,7 +273,7 @@ Once verified, replace the body of `initializeProviders` to read from KV as desc
         type Bindings = {
           AI: AiGatewayBindings;
           AI_GATEWAY_NAME: string;
-          MODEL_CONFIG: KVNamespace;
+          PROVIDER_CONFIG: KVNamespace;
           // existing env vars
         };
         ```
@@ -292,19 +292,19 @@ interface ProviderConfig {
 // Module-level cache for provider factories
 let providersMap: Record<string, (model: string) => LanguageModelV1> = {};
 let providersInitializedAt = 0;
-const CACHE_TTL_MS = Number(env.MODEL_CACHE_TTL_MS) || 300_000;
+const CACHE_TTL_MS = Number(env.PROVIDER_CACHE_TTL_MS) || 300_000;
 
 async function initializeProviders(env: CloudflareBindings): Promise<Record<string, (model: string) => LanguageModelV1>> {
   const providers: Record<string, (model: string) => LanguageModelV1> = {};
   try {
-    const list = await env.MODEL_CONFIG.list();
+    const list = await env.PROVIDER_CONFIG.list();
     for (const { name: provider } of list.keys) {
-      const raw = await env.MODEL_CONFIG.get(provider);
+      const raw = await env.PROVIDER_CONFIG.get(provider);
       if (!raw) continue;
       let cfg: ProviderConfig;
       try { cfg = JSON.parse(raw); }
       catch (e) {
-        console.error(`Invalid JSON in MODEL_CONFIG for '${provider}':`, e);
+        console.error(`Invalid JSON in PROVIDER_CONFIG for '${provider}':`, e);
         continue;
       }
       const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
@@ -361,7 +361,7 @@ app.route('/', aiRouter);
 
 6.  **Testing & Error Scenarios:**
     *   Run `direnv exec . npx wrangler dev --remote`.
-    *   Insert/update KV entries, e.g. `wrangler kv:key put --binding=MODEL_CONFIG google '{...}'`.
+    *   Insert/update KV entries, e.g. `wrangler kv:key put --binding=PROVIDER_CONFIG google '{...}'`.
     *   Send test prompts to each model via `curl http://localhost:8787/v1/chat/completions -d '{"model":"<provider>/<modelName>","messages":[...]}'.`
     *   Verify valid responses and check logs for errors.
     *   Test invalid JSON in KV and ensure errors are logged without crashing.
@@ -375,7 +375,7 @@ app.route('/', aiRouter);
 
 1.  **Set Up Secret:** `npx wrangler secret put ANTHROPIC_API_KEY`
 2.  **Install SDK:** `npm install @ai-sdk/anthropic`
-3.  **Update KV:** Add an entry for an Anthropic model (e.g., `claude-3-haiku`) to `model_configs.json` and upload via `kv bulk put`. Ensure `provider`, `model`, `apiKeySecretName`, and `gatewayProviderPath` are correct for Anthropic and your AI Gateway setup.
+3.  **Update KV:** Add an entry for an Anthropic model (e.g., `claude-3-haiku`) to `provider_configs.json` and upload via `kv bulk put`. Ensure `provider`, `model`, `apiKeySecretName`, and `gatewayProviderPath` are correct for Anthropic and your AI Gateway setup.
 4.  **Update Worker Code (`src/index.ts`):**
     *   Add `import { createAnthropic } from '@ai-sdk/anthropic';`.
     *   Add `ANTHROPIC_API_KEY: string;` to `Bindings`.
