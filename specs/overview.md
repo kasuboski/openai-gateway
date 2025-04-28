@@ -169,6 +169,91 @@ sequenceDiagram
     *   `npx wrangler deploy`
     *   Test the deployed endpoint.
 
+## Provider/Model Format
+
+Before diving into dynamic KV configuration, we'll switch to a provider-centric model format.
+
+Clients must specify the `model` parameter as `<provider>/<modelName>` (e.g. `openai/gpt-4` or `google/chat-bison`). The gateway will:
+
+1. Split the `model` string on `/` to extract `provider` and `modelName`.
+2. Look up the provider configuration in KV (keyed by `provider`) to get credentials and gateway path.
+3. Use the Vercel AI SDK for that provider to obtain a client factory.
+4. Call the client factory with `modelName` at request time to instantiate a `LanguageModelV1`.
+
+This lets us support any model from a configured provider without enumerating each model in KV.
+
+### Local Testing Without KV
+
+For initial testing, mirror the future KV-based `initializeProviders` but use a static config:
+
+```ts
+// Module-level cache
+let providersMap: Record<string, (model: string) => LanguageModelV1> = {};
+let providersInitializedAt = 0;
+const CACHE_TTL_MS = 300_000;
+
+// Static provider configuration
+const staticProviderConfigs = [
+  {
+    provider: 'google',
+    apiKey: env.GOOGLE_API_KEY,
+    gatewayProviderPath: 'google/gemini',
+  },
+];
+
+// Static initializeProviders that mimics KV loading
+async function initializeProviders(env: CloudflareBindings): Promise<typeof providersMap> {
+  const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
+  const url = await gateway.getUrl(staticProviderConfigs[0].gatewayProviderPath);
+  providersMap['google'] = createGoogleGenerativeAI({
+    baseURL: `${url}/v1beta`,
+    apiKey: staticProviderConfigs[0].apiKey,
+    headers: { 'cf-aig-authorization': `Bearer ${env.AI_GATEWAY_TOKEN}` },
+  });
+  providersInitializedAt = Date.now();
+  return providersMap;
+}
+
+// Middleware with TTL caching
+app.use('*', async (c, next) => {
+  const now = Date.now();
+  if (!providersMap || now - providersInitializedAt > CACHE_TTL_MS) {
+    await initializeProviders(c.env);
+  }
+  await next();
+});
+
+// Router using provider/model split
+const aiRouter = createOpenAICompat({
+  languageModels: (id) => {
+    const [provider, modelName] = id.split('/');
+    return providersMap[provider]?.(modelName) ?? null;
+  },
+});
+app.route('/', aiRouter);
+```
+
+Run locally:
+```bash
+direnv exec . npx wrangler dev
+curl http://localhost:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"google/gemini","messages":[{"role":"user","content":"Test gemini usage."}]}'
+```
+
+Once verified, replace the body of `initializeProviders` to read from KV as described below.
+
+### High-Level Steps
+
+1. Store provider configs in KV: key=`<provider>`, value=`{ provider, apiKeySecretName, gatewayProviderPath }`.
+2. Rename `ModelConfig` to `ProviderConfig` and remove the `model` field.
+3. In KV initialization, load provider configs into a `providersMap: Record<string, (model: string) => LanguageModelV1>`.
+4. Update the `languageModels` function to parse `<provider>/<modelName>` and call the matching factory.
+5. Update caching/TTL logic to reload `providersMap` when expired.
+6. Remove per-model KV entries and migrate them to provider-level entries.
+
+## 2. Implementation Plan
+
 **Phase 2: Dynamic Configuration with KV**
 
 1.  **Bindings Update:**
@@ -194,85 +279,90 @@ sequenceDiagram
         ```
 
 2.  **Define Configuration Schema:**
-    ```ts
-    interface ModelConfig {
-      provider: string;
-      model: string;
-      apiKeySecretName: string;
-      gatewayProviderPath: string;
-    }
-    ```
+```ts
+interface ProviderConfig {
+  provider: string;
+  apiKeySecretName: string;
+  gatewayProviderPath: string;
+}
+```
 
 3.  **Async Initialization Function:**
-    ```typescript
-    // Module-level cache
-    let modelsMap: Record<string, LanguageModelV1> = {};
-    let modelsInitializedAt = 0;
-    const CACHE_TTL_MS = Number(env.MODEL_CACHE_TTL_MS) || 300_000;
+```ts
+// Module-level cache for provider factories
+let providersMap: Record<string, (model: string) => LanguageModelV1> = {};
+let providersInitializedAt = 0;
+const CACHE_TTL_MS = Number(env.MODEL_CACHE_TTL_MS) || 300_000;
 
-    async function initializeLanguageModels(env: CloudflareBindings): Promise<Record<string, LanguageModelV1>> {
-      const models: Record<string, LanguageModelV1> = {};
-      try {
-        const list = await env.MODEL_CONFIG.list();
-        for (const { name } of list.keys) {
-          const raw = await env.MODEL_CONFIG.get(name);
-          if (!raw) continue;
-          let cfg: ModelConfig;
-          try { cfg = JSON.parse(raw); }
-          catch (e) {
-            console.error(`Invalid JSON in MODEL_CONFIG for '${name}':`, e);
-            continue;
-          }
-          const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
-          const url = await gateway.getUrl(cfg.gatewayProviderPath);
-          if (!url) {
-            console.error(`Failed to resolve gateway URL for '${cfg.gatewayProviderPath}'`);
-            continue;
-          }
-          const headers = { 'cf-aig-authorization': `Bearer ${env.AI_GATEWAY_TOKEN}` };
-          let clientFactory;
-          switch (cfg.provider) {
-            case 'google':
-              clientFactory = createGoogleGenerativeAI({ baseURL: `${url}/v1beta`, apiKey: env[cfg.apiKeySecretName], headers });
-              break;
-            // Add more providers in later phases
-            default:
-              console.warn(`Unsupported provider '${cfg.provider}'`);
-              continue;
-          }
-          models[name] = clientFactory(cfg.model);
-        }
-        modelsInitializedAt = Date.now();
-        modelsMap = models;
-      } catch (e) {
-        console.error('Error initializing models from KV:', e);
+async function initializeProviders(env: CloudflareBindings): Promise<Record<string, (model: string) => LanguageModelV1>> {
+  const providers: Record<string, (model: string) => LanguageModelV1> = {};
+  try {
+    const list = await env.MODEL_CONFIG.list();
+    for (const { name: provider } of list.keys) {
+      const raw = await env.MODEL_CONFIG.get(provider);
+      if (!raw) continue;
+      let cfg: ProviderConfig;
+      try { cfg = JSON.parse(raw); }
+      catch (e) {
+        console.error(`Invalid JSON in MODEL_CONFIG for '${provider}':`, e);
+        continue;
       }
-      return modelsMap;
+      const gateway = env.AI.gateway(env.AI_GATEWAY_NAME);
+      const url = await gateway.getUrl(cfg.gatewayProviderPath);
+      if (!url) {
+        console.error(`Failed to resolve gateway URL for '${cfg.gatewayProviderPath}'`);
+        continue;
+      }
+      const headers = { 'cf-aig-authorization': `Bearer ${env.AI_GATEWAY_TOKEN}` };
+      let clientFactory;
+      switch (cfg.provider) {
+        case 'google':
+          clientFactory = createGoogleGenerativeAI({ baseURL: `${url}/v1beta`, apiKey: env[cfg.apiKeySecretName], headers });
+          break;
+        case 'openai':
+          clientFactory = createOpenAI({ baseURL: `${url}/v1`, apiKey: env[cfg.apiKeySecretName], headers });
+          break;
+        default:
+          console.warn(`Unsupported provider '${cfg.provider}'`);
+          continue;
+      }
+      providers[provider] = clientFactory;
     }
+    providersInitializedAt = Date.now();
+    providersMap = providers;
+  } catch (e) {
+    console.error('Error initializing providers from KV:', e);
+  }
+  return providersMap;
+}
+```
 
 4.  **Middleware with TTL Caching:**
-    ```typescript
-    app.use('*', async (c, next) => {
-      const now = Date.now();
-      if (!modelsMap || now - modelsInitializedAt > CACHE_TTL_MS) {
-        await initializeLanguageModels(c.env);
-      }
-      await next();
-    });
-    ```
+```ts
+app.use('*', async (c, next) => {
+  const now = Date.now();
+  if (!providersMap || now - providersInitializedAt > CACHE_TTL_MS) {
+    await initializeProviders(c.env);
+  }
+  await next();
+});
+```
 
 5.  **Create Router:**
-    ```typescript
-    const aiRouter = createOpenAICompat({
-      languageModels: (id) => modelsMap[id] ?? null,
-    });
-    app.route('/', aiRouter);
-    ```
+```typescript
+const aiRouter = createOpenAICompat({
+  languageModels: (id) => {
+    const [provider, modelName] = id.split('/');
+    return providersMap[provider]?.(modelName) ?? null;
+  },
+});
+app.route('/', aiRouter);
+```
 
 6.  **Testing & Error Scenarios:**
     *   Run `direnv exec . npx wrangler dev --remote`.
-    *   Insert/update KV entries, e.g. `wrangler kv:key put --binding=MODEL_CONFIG gemini-flash '{...}'`.
-    *   Send test prompts to each model via `curl http://localhost:8787/v1/chat/completions -d '{"model":"<key>","messages":[...]}'.`
+    *   Insert/update KV entries, e.g. `wrangler kv:key put --binding=MODEL_CONFIG google '{...}'`.
+    *   Send test prompts to each model via `curl http://localhost:8787/v1/chat/completions -d '{"model":"<provider>/<modelName>","messages":[...]}'.`
     *   Verify valid responses and check logs for errors.
     *   Test invalid JSON in KV and ensure errors are logged without crashing.
 
@@ -289,7 +379,7 @@ sequenceDiagram
 4.  **Update Worker Code (`src/index.ts`):**
     *   Add `import { createAnthropic } from '@ai-sdk/anthropic';`.
     *   Add `ANTHROPIC_API_KEY: string;` to `Bindings`.
-    *   Add a `case 'anthropic':` to the `switch` statement within `initializeLanguageModels` to handle Anthropic client instantiation.
+    *   Add a `case 'anthropic':` to the `switch` statement within `initializeProviders` to handle Anthropic client instantiation.
 5.  **Test & Deploy:** Test with `model: "claude-3-haiku"` (or your configured name). Verify requests route correctly via AI Gateway to Anthropic.
 
 **Phase 4: Implement Client API Key Verification**
@@ -304,18 +394,21 @@ sequenceDiagram
     *   Implement the `verifyAPIKey` function within the `createOpenAICompat` options:
         ```typescript
         const aiRouter = createOpenAICompat({
-            languageModels: (modelId: string) => modelsMap[modelId] ?? null,
-            async verifyAPIKey(key, c) { // Hono context 'c' is passed
-                if (!c) return false;
-                const env = c.env as Bindings; // Access env via context
-                try {
-                    const clientData = await env.CLIENT_KEYS.get(key);
-                    return clientData !== null; // Key exists in KV
-                } catch (e) {
-                    console.error("Error verifying client API key:", e);
-                    return false;
-                }
-            },
+          languageModels: (id) => {
+            const [provider, modelName] = id.split('/');
+            return providersMap[provider]?.(modelName) ?? null;
+          },
+          async verifyAPIKey(key, c) { // Hono context 'c' is passed
+            if (!c) return false;
+            const env = c.env as Bindings; // Access env via context
+            try {
+              const clientData = await env.CLIENT_KEYS.get(key);
+              return clientData !== null; // Key exists in KV
+            } catch (e) {
+              console.error("Error verifying client API key:", e);
+              return false;
+            }
+          },
         });
         ```
 3.  **Test & Deploy:** Deploy the updated Worker. Clients now need to include a valid `Authorization: Bearer <client_key>` header where `<client_key>` exists in the `CLIENT_KEYS` KV namespace. Test with and without valid keys.
