@@ -3,13 +3,19 @@
 	"scripts": {
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy --minify",
-		"cf-typegen": "wrangler types --env-interface CloudflareBindings"
+		"cf-typegen": "wrangler types --env-interface CloudflareBindings",
+		"lint": "biome lint --write ./src",
+		"format": "biome format --write ./src",
+		"check": "biome check ./src && tsc --noEmit"
 	},
 	"dependencies": {
+		"@ai-sdk/google": "^1.2.13",
+		"@ns/ai-to-openai-hono": "npm:@jsr/ns__ai-to-openai-hono@^0.1.1",
 		"hono": "^4.7.7"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20250426.0",
+		"@biomejs/biome": "1.9.4",
+		"typescript": "^5.8.3",
 		"wrangler": "^4.13.2"
 	}
 }
