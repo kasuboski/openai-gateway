@@ -48,6 +48,10 @@
 			"binding": "PROVIDER_CONFIG",
 			"preview_id": "provider_config_preview",
 			"id": "643e6761b76b42d4a513943d66378305"
+		},
+		{
+			"binding": "CLIENT_KEYS",
+			"id": "62eec3a31a4d47baabb0638bb51fe376"
 		}
 	]
 

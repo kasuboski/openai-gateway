@@ -89,6 +89,20 @@ app.use("*", async (c, next) => {
 	await next();
 });
 
+// Authenticate all routes using CLIENT_KEYS
+app.use("*", async (c, next) => {
+	const authHeader = c.req.header("Authorization");
+	if (!authHeader) {
+		return c.json({ message: "Missing Authorization header" }, 403);
+	}
+	const key = authHeader.split(" ")[1];
+	const valid = (await c.env.CLIENT_KEYS.get(key)) !== null;
+	if (!valid) {
+		return c.json({ message: "Invalid API key" }, 403);
+	}
+	return next();
+});
+
 const aiRouter = createOpenAICompat({
 	languageModels: (modelId: string) => {
 		const [provider, modelName] = modelId.split("/");
